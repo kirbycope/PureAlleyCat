@@ -1,0 +1,17 @@
+# The game itself is not ours to distribute. Bring your own CAT.EXE.
+*.EXE
+*.exe
+
+# Build output
+*.o
+*.obj
+*.pdb
+*.ppm
+# Screenshots are of the game, so they are its artwork, not ours. Keep them out.
+*.png
+purealleycat_demo
+purealleycat_demo.exe
+call_trace.txt
+
+__pycache__/
+*.pyc
