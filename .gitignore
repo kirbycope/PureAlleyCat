@@ -15,3 +15,6 @@ call_trace.txt
 
 __pycache__/
 *.pyc
+
+# Captured audio is the game recorded, not ours.
+*.wav
