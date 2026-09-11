@@ -57,8 +57,9 @@ Everything the game asks of the machine:
 | `int 0x1a` | BIOS tick counter, the game clock |
 | `int 0x10` | set the video mode |
 | `int 0x11` | equipment list, for the game-port check |
-| port `0x61`, `0x40` | PC speaker gate and the PIT |
-| port `0x201` | joystick |
+| port `0x61`, `0x42`, `0x43` | PC speaker gate and PIT channel 2, the tone |
+| port `0x40`, `0x43` | PIT channel 0, the stopwatch it times the joystick with |
+| port `0x201` | the game port |
 | port `0x3da` | CGA status, polled for vertical retrace |
 | port `0x60` + `int 9` | the keyboard, through a handler the game installs itself |
 
@@ -110,7 +111,13 @@ colours, so a host never needs to know any of that.
 | `alleycat_framebuffer()` | 320x200 bytes, each 0-3 |
 | `alleycat_palette(out[4])` | the four colours as `0xRRGGBB` |
 | `alleycat_key(scancode, down)` | queue a key |
+| `alleycat_joystick_present(on)` | report a game adapter in the BIOS equipment list |
+| `alleycat_joystick(x, y, b1, b2)` | where the stick is, each axis -1, 0 or 1 |
 | `alleycat_ready()` | non-zero once a graphics mode is set |
+| `alleycat_text_row(n)`, `alleycat_text_rows()` | the BIOS text screen the setup questions print to |
+| `alleycat_screen_painted()` | non-zero framebuffer bytes, so a host knows which screen is up |
+| `alleycat_audio_read(out, n)`, `alleycat_audio_rate()` | drain generated PC speaker samples |
+| `alleycat_speaker_on()`, `alleycat_speaker_hz()` | what the speaker is being asked to do |
 | `alleycat_instructions()`, `alleycat_status()` | diagnostics |
 | `alleycat_fault_opcode()`, `alleycat_fault_address()` | what stopped a run, if anything |
 
@@ -118,13 +125,41 @@ Keys go through the game's own INT 9 handler, because it installs one and reads 
 rather than calling INT 16h. `alleycat_key` queues a set-1 make or break code and raises interrupt
 9 once interrupts are enabled, which is what the hardware did.
 
+## The game port
+
+Answering yes to "Do you want to use a joystick (Y/N)?" puts the game down a path with three parts
+to it, and all three have to work or the answer does nothing.
+
+It reads the BIOS equipment list through INT 11h and gives up unless bit 12, the game adapter, is
+set: that is what `alleycat_joystick_present` turns on. It then times the port itself. Writing to
+`0x201` fires a one-shot per axis, bits 0-3 read high while each is charging, and the game measures
+how long that takes against PIT channel 0, which it latches with `out 0x43, 0` and reads a byte at
+a time from port `0x40`. It buckets the result at 1286 and 2586 counts, so each axis resolves to
+three positions and no more; `alleycat_joystick` takes -1, 0 or 1 and the library picks a charge
+time inside the matching bucket. Buttons are active low in bits 4 and 5.
+
+That is why channel 0 has to be a real down-counter at 1.193182 MHz rather than any old changing
+number: the game's stopwatch is the counter, and a value that moves the wrong way or at the wrong
+rate puts every reading in the wrong bucket.
+
+The stick is a level rather than an event, because the game samples the port whenever it likes, so
+a host sets it every frame and the library reports the current position:
+
+```c
+alleycat_joystick_present(1);      /* before alleycat_init, which writes the equipment word */
+alleycat_init(exe, size);
+while (running) {
+    alleycat_joystick(pad_x, pad_y, pad_button_a, pad_button_b);
+    alleycat_update();
+}
+```
+
 ## Known gaps
 
-- **Sound is silent.** Writes to the speaker gate and the PIT are accepted and discarded. The data
-  to drive a square wave is all there; nothing consumes it yet.
-- **The joystick always reads centred with buttons up.** `alleycat_key` covers the keyboard only.
 - **The palette is fixed** to CGA palette 1, high intensity. A program can change it through port
   `0x3d9`; this one does not appear to, but the write would not be honoured if it did.
+- **Only joystick A exists.** Bits 2 and 3 of port `0x201`, the second stick's axes, always read
+  low. The game never looks at them.
 
 ## Provenance and licence
 

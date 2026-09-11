@@ -55,6 +55,17 @@ class CPU:
         self.text = [[' '] * 40 for _ in range(25)]
         self.cursor = [0, 0]
         self.palette_call = None
+        # PIT channel 0, latched with `out 0x43, 0` and read a byte at a time from port 0x40.
+        self.pit0_latch = 0
+        self.pit0_high_next = False
+        # The game port. joystick_present sets the BIOS equipment bit the game's adapter check
+        # looks for; joystick_x and joystick_y are -1, 0 or 1, which is all the game resolves.
+        self.joystick_present = False
+        self.joystick_x = 0
+        self.joystick_y = 0
+        self.joystick_buttons = (False, False)
+        self.joystick_fired = 0
+        self.joystick_timing = False
 
     # ---- memory -------------------------------------------------------------------------
     def phys(self, seg: int, off: int) -> int:
@@ -708,7 +719,8 @@ class CPU:
                 return True
             return True
         if n == 0x11:
-            self.r[AX] = 0x0021      # CGA 80x25, no game port
+            # CGA 80x25; bit 12 is the game adapter, which the joystick check at 0xD215 wants.
+            self.r[AX] = 0x0021 | (0x1000 if self.joystick_present else 0)
             return True
         if n == 0x12:
             self.r[AX] = 640
@@ -729,14 +741,47 @@ class CPU:
         if port == 0x61:
             return getattr(self, "port61", 0)
         if port == 0x40:
-            return (self.instructions >> 2) & 0xFF
+            value = (self.pit0_latch >> 8) if self.pit0_high_next else (self.pit0_latch & 0xFF)
+            self.pit0_high_next = not self.pit0_high_next
+            if not self.pit0_high_next:
+                self.pit0_latch = self.pit0_now()
+            return value
         if port == 0x201:
-            return 0xF0              # joystick idle, buttons up
+            byte = 0xF0                          # axis pairs low, every button up
+            if self.joystick_buttons[0]:
+                byte &= ~0x10
+            if self.joystick_buttons[1]:
+                byte &= ~0x20
+            if self.joystick_timing:
+                counts = (self.instructions - self.joystick_fired) * 65536 // 6000
+                if counts < self.joy_charge(self.joystick_x):
+                    byte |= 0x01
+                if counts < self.joy_charge(self.joystick_y):
+                    byte |= 0x02
+                if not byte & 0x03:
+                    self.joystick_timing = False
+            return byte
         return 0xFF
+
+    def pit0_now(self) -> int:
+        """Channel 0 counts down at 1.193182 MHz, wrapping through 65536 every BIOS tick."""
+        return (-(self.instructions * 65536 // 6000)) & 0xFFFF
+
+    @staticmethod
+    def joy_charge(axis: int) -> int:
+        """PIT counts an axis holds its one-shot high. The game buckets at 1286 and 2586."""
+        return 600 if axis < 0 else (3200 if axis > 0 else 1900)
 
     def port_out(self, port: int, value: int) -> None:
         if port == 0x61:
             self.port61 = value
+        elif port == 0x43 and value >> 6 == 0:
+            self.pit0_latch = self.pit0_now()
+            self.pit0_high_next = False
+        elif port == 0x201:
+            # Any write fires the axis one-shots; the hardware ignores the value.
+            self.joystick_fired = self.instructions
+            self.joystick_timing = True
 
 
 LOAD_SEGMENT = 0x1000   # the same base Ghidra used, so addresses match the decompilation
@@ -776,7 +821,7 @@ def load(cpu: CPU, path: Path) -> int:
     cpu.mem[psp + 1] = 0x20
     # The BIOS data area: equipment word says CGA 80x25, and the tick counter lives at 0040:006C.
     cpu.mem[0x410] = 0x21
-    cpu.mem[0x411] = 0x00
+    cpu.mem[0x411] = 0x10 if cpu.joystick_present else 0x00
     return size
 
 

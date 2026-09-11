@@ -69,6 +69,18 @@ void alleycat_palette(uint32_t out[4]);
 /* Press or release a key. `down` is non-zero for a press. */
 void alleycat_key(int scancode, int down);
 
+/* The game port. Alley Cat asks "joystick? (y/n)" at startup and, if answered yes, checks the
+   BIOS equipment list for a game adapter before it will read the port at all, so a host says
+   whether the machine it is running on has one. Call it before alleycat_init, which is what
+   writes the equipment word; calling it later takes effect on the next init.
+
+   alleycat_joystick then feeds the stick. x and y are -1, 0 or 1, because that is all the game
+   resolves out of the analogue axes: -1 is left or up, 1 is right or down. Buttons are pressed
+   when non-zero. It is a level, not an event, so a host sets it every frame and the library
+   reports it whenever the game samples the port. */
+void alleycat_joystick_present(int present);
+void alleycat_joystick(int x, int y, int button1, int button2);
+
 /* Non-zero once the program has set a graphics mode, i.e. it is past its startup checks. */
 int alleycat_ready(void);
 
@@ -174,7 +186,27 @@ static uint32_t SQUARE_PHASE;   /* square wave phase, scaled by AUDIO_RATE */
 static int      SQUARE_LEVEL;
 static uint16_t PIT2_DIVISOR = 0;
 static int      PIT2_HIGH_BYTE_NEXT = 0;
+/* PIT channel 0 is the game's stopwatch. It free-runs at PIT_HZ and counts down through 65536
+   every BIOS tick, which is TICK_STEPS instructions here, and the game latches it with
+   `out 0x43, 0` then reads the low byte and the high. It times the joystick's one-shots by
+   subtracting two of those readings, so the count has to fall at roughly the right rate and in
+   the right direction; a counter that merely changes is not enough. */
+#define PIT0_PER_TICK 65536u
+static uint16_t PIT0_LATCH;
+static int      PIT0_HIGH_BYTE_NEXT;
 static uint32_t RETRACE;
+/* The game port. A PC joystick is two potentiometers and two buttons on port 0x201: writing to
+   the port fires a one-shot per axis, bits 0-3 read high while each is still charging, and the
+   host times how long that takes. Alley Cat only wants three positions out of each axis - the
+   routine at 0x84D1 buckets the count at 1286 and 2586 - so the host hands over -1, 0 or 1 and
+   the charge time is picked inside the matching bucket. Buttons are active low in bits 4 and 5.
+   JOY_PRESENT survives a reset, because a host sets it once for the machine it is running on and
+   alleycat_init is what writes it into the BIOS equipment word. */
+static int      JOY_PRESENT;
+static int      JOY_X, JOY_Y;
+static int      JOY_BUTTON1, JOY_BUTTON2;
+static uint64_t JOY_FIRED;
+static int      JOY_TIMING;
 static int      STOPPED;
 static int      BAD_OP = -1;
 static uint16_t BAD_CS, BAD_IP;
@@ -390,14 +422,48 @@ static int condition(int code)
 
 /* ---- the platform ------------------------------------------------------------------------------------- */
 
+/* Where PIT channel 0 has counted down to, in its own 1.193182 MHz counts. */
+static uint16_t pit0_now(void)
+{
+    return (uint16_t)(0u - (uint16_t)((ICOUNT * PIT0_PER_TICK / TICK_STEPS) & 0xFFFFu));
+}
+
+/* How long an axis holds its one-shot high, in PIT counts. Centre sits between the game's two
+   thresholds; the ends sit clear of them, with room for the polling loop's own granularity of
+   about 140 counts per pass. */
+static uint32_t joy_charge(int axis)
+{
+    if (axis < 0) return 600u;
+    if (axis > 0) return 3200u;
+    return 1900u;
+}
+
 static uint8_t port_in(uint16_t port)
 {
     switch (port) {
     case 0x3DA: RETRACE++; return (uint8_t)((RETRACE & 1) ? 0x09 : 0x00);
     case 0x60:  return SCANCODE;
     case 0x61:  return PORT61;
-    case 0x40:  return (uint8_t)(ICOUNT >> 2);
-    case 0x201: return 0xF0;
+    case 0x40: {
+        uint8_t v = PIT0_HIGH_BYTE_NEXT ? (uint8_t)(PIT0_LATCH >> 8) : (uint8_t)PIT0_LATCH;
+        PIT0_HIGH_BYTE_NEXT = !PIT0_HIGH_BYTE_NEXT;
+        /* Both halves of a latched reading have been handed over, so the next pair reads live
+           again even if the caller forgets to latch. */
+        if (!PIT0_HIGH_BYTE_NEXT) PIT0_LATCH = pit0_now();
+        return v;
+    }
+    case 0x201: {
+        uint8_t v = 0xF0;                       /* both axis pairs low, every button up */
+        if (JOY_BUTTON1) v &= (uint8_t)~0x10;
+        if (JOY_BUTTON2) v &= (uint8_t)~0x20;
+        if (JOY_TIMING) {
+            uint32_t counts = (uint32_t)((ICOUNT - JOY_FIRED) * PIT0_PER_TICK / TICK_STEPS);
+            if (counts < joy_charge(JOY_X)) v |= 0x01;
+            if (counts < joy_charge(JOY_Y)) v |= 0x02;
+            if (!(v & 0x03)) JOY_TIMING = 0;
+        }
+        return v;
+    }
     default:    return 0xFF;
     }
 }
@@ -413,6 +479,9 @@ static void port_out(uint16_t port, uint8_t value)
            constantly to read the clock, and that must not disturb the tone. */
         if ((value >> 6) == 2) {
             PIT2_HIGH_BYTE_NEXT = 0;
+        } else if ((value >> 6) == 0) {
+            PIT0_LATCH = pit0_now();
+            PIT0_HIGH_BYTE_NEXT = 0;
         }
         break;
     case 0x42:
@@ -424,6 +493,11 @@ static void port_out(uint16_t port, uint8_t value)
             PIT2_DIVISOR = (uint16_t)((PIT2_DIVISOR & 0xFF00) | value);
             PIT2_HIGH_BYTE_NEXT = 1;
         }
+        break;
+    case 0x201:
+        /* Any write fires the axis one-shots; the value written is ignored by the hardware. */
+        JOY_FIRED = ICOUNT;
+        JOY_TIMING = 1;
         break;
     default:
         break;
@@ -490,7 +564,9 @@ static int bios(int n)
             return 1;
         }
     }
-    if (n == 0x11) { R[rAX] = 0x0021; return 1; }
+    /* Equipment list. Bit 12 is the game adapter, which is what the game's joystick check
+       at 0xD215 looks at before it will time the port at all. */
+    if (n == 0x11) { R[rAX] = (uint16_t)(0x0021 | (JOY_PRESENT ? 0x1000 : 0)); return 1; }
     if (n == 0x12) { R[rAX] = 640;    return 1; }
     if (n == 0x20) { STOPPED = 1; STATUS = "int 20h: program exit"; return 1; }
     if (n == 0x21 && ah == 0x4C) { STOPPED = 1; STATUS = "int 21h/4C: program exit"; return 1; }
@@ -960,6 +1036,8 @@ int alleycat_init(const void *exe_bytes, int exe_size)
     FLAGS = 0x0002; IP = 0; ICOUNT = 0; VIDEO_MODE = -1; STOPPED = 0;
     SCANCODE = 0; PORT61 = 0; RETRACE = 0; KEYQ_HEAD = KEYQ_TAIL = 0;
     PIT2_DIVISOR = 0; PIT2_HIGH_BYTE_NEXT = 0;
+    PIT0_LATCH = 0; PIT0_HIGH_BYTE_NEXT = 0;
+    JOY_X = JOY_Y = 0; JOY_BUTTON1 = JOY_BUTTON2 = 0; JOY_FIRED = 0; JOY_TIMING = 0;
     AUDIO_W = AUDIO_R = 0; AUDIO_ACC = 0; SQUARE_PHASE = 0; SQUARE_LEVEL = 0;
     STATUS = "running";
     text_clear();
@@ -995,9 +1073,10 @@ int alleycat_init(const void *exe_bytes, int exe_size)
     /* A PSP whose first bytes are INT 20h, so a program that returns into it exits. */
     MEM[(uint32_t)PSP_SEG << 4] = 0xCD;
     MEM[((uint32_t)PSP_SEG << 4) + 1] = 0x20;
-    /* BIOS data area: equipment word reports a CGA in 80x25. */
+    /* BIOS data area: equipment word reports a CGA in 80x25, plus the game adapter when the
+       host has said there is one. The game reads this once, at startup. */
     MEM[0x410] = 0x21;
-    MEM[0x411] = 0x00;
+    MEM[0x411] = (uint8_t)(JOY_PRESENT ? 0x10 : 0x00);
     return 0;
 }
 
@@ -1016,6 +1095,22 @@ void alleycat_run(int instructions)
 }
 
 void alleycat_update(void) { alleycat_run(TICK_STEPS); }
+
+void alleycat_joystick_present(int present)
+{
+    JOY_PRESENT = present ? 1 : 0;
+    /* Keep a running machine in step with the answer, even though the game only reads the
+       equipment word once, so a host that plugs a pad in before the question is asked works. */
+    MEM[0x411] = (uint8_t)(JOY_PRESENT ? 0x10 : 0x00);
+}
+
+void alleycat_joystick(int x, int y, int button1, int button2)
+{
+    JOY_X = x < 0 ? -1 : (x > 0 ? 1 : 0);
+    JOY_Y = y < 0 ? -1 : (y > 0 ? 1 : 0);
+    JOY_BUTTON1 = button1 ? 1 : 0;
+    JOY_BUTTON2 = button2 ? 1 : 0;
+}
 
 void alleycat_key(int scancode, int down)
 {
