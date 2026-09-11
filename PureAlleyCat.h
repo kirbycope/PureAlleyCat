@@ -82,6 +82,19 @@ int alleycat_text_rows(void);
    show the text rows over the top or get out of the way. */
 int alleycat_screen_painted(void);
 
+/* The PC speaker. alleycat_speaker_hz is the tone the timer is programmed for, and
+   alleycat_speaker_on reports whether the gate is open. A host polls both each frame and drives a
+   square wave: the speaker had no volume control, so amplitude is the host's choice. */
+int alleycat_speaker_on(void);
+int alleycat_speaker_hz(void);
+
+/* Drains generated audio: signed 16-bit mono at alleycat_audio_rate(). Returns how many samples
+   were written, which may be fewer than asked for. Call it every frame; what is not drained is
+   eventually dropped rather than allowed to drift further and further behind. */
+int alleycat_audio_read(int16_t *out, int max_samples);
+int alleycat_audio_rate(void);
+int alleycat_audio_available(void);
+
 /* Total instructions retired, and the last stop reason, for diagnostics. */
 uint64_t alleycat_instructions(void);
 const char *alleycat_status(void);
@@ -143,6 +156,24 @@ static char     TEXT[TEXT_ROWS][TEXT_COLS + 1];
 static int      CUR_ROW, CUR_COL;
 static uint8_t  SCANCODE;
 static uint8_t  PORT61;
+/* PC speaker. The game drives it the textbook way: a divisor into PIT channel 2 through port
+   0x42, mode 3 (square wave) selected by 0xB6 on port 0x43, and the gate opened by setting the
+   low two bits of port 0x61. Tone in hertz is PIT_HZ / divisor. */
+#define PIT_HZ 1193182u
+/* Audio is generated here rather than by the host, because the host only gets to look between
+   frames. At 480 frames a second that is one glance every ~228 instructions, and a tone that
+   starts and stops inside that window is simply never seen. Sampling inside the instruction loop
+   catches every one. */
+#define AUDIO_RATE 22050
+#define INSTR_PER_SEC (TICK_STEPS * 182 / 10)
+#define AUDIO_RING 16384
+static int16_t  AUDIO[AUDIO_RING];
+static int      AUDIO_W, AUDIO_R;
+static uint32_t AUDIO_ACC;      /* instruction-to-sample fraction, scaled by AUDIO_RATE */
+static uint32_t SQUARE_PHASE;   /* square wave phase, scaled by AUDIO_RATE */
+static int      SQUARE_LEVEL;
+static uint16_t PIT2_DIVISOR = 0;
+static int      PIT2_HIGH_BYTE_NEXT = 0;
 static uint32_t RETRACE;
 static int      STOPPED;
 static int      BAD_OP = -1;
@@ -373,7 +404,30 @@ static uint8_t port_in(uint16_t port)
 
 static void port_out(uint16_t port, uint8_t value)
 {
-    if (port == 0x61) PORT61 = value;
+    switch (port) {
+    case 0x61:
+        PORT61 = value;
+        break;
+    case 0x43:
+        /* Only a channel 2 control word concerns the speaker. The game also latches channel 0
+           constantly to read the clock, and that must not disturb the tone. */
+        if ((value >> 6) == 2) {
+            PIT2_HIGH_BYTE_NEXT = 0;
+        }
+        break;
+    case 0x42:
+        /* Access mode lo/hi: the low byte arrives first, then the high. */
+        if (PIT2_HIGH_BYTE_NEXT) {
+            PIT2_DIVISOR = (uint16_t)((PIT2_DIVISOR & 0x00FF) | ((uint16_t)value << 8));
+            PIT2_HIGH_BYTE_NEXT = 0;
+        } else {
+            PIT2_DIVISOR = (uint16_t)((PIT2_DIVISOR & 0xFF00) | value);
+            PIT2_HIGH_BYTE_NEXT = 1;
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static void text_clear(void)
@@ -841,6 +895,30 @@ static void execute(uint8_t op, int seg_override, int rep)
     }
 }
 
+/* One audio sample at the current speaker state. Silence when the gate is shut, so the ring is
+   always continuous and the host never has to guess at timing. */
+static void audio_sample(void)
+{
+    int next = (AUDIO_W + 1) % AUDIO_RING;
+    int16_t value = 0;
+    if ((PORT61 & 0x03) == 0x03 && PIT2_DIVISOR > 0) {
+        uint32_t hz = PIT_HZ / PIT2_DIVISOR;
+        if (hz > 30 && hz < 12000) {
+            /* Two transitions make a cycle, so advance at twice the frequency and flip. */
+            SQUARE_PHASE += hz * 2u;
+            while (SQUARE_PHASE >= AUDIO_RATE) {
+                SQUARE_PHASE -= AUDIO_RATE;
+                SQUARE_LEVEL = !SQUARE_LEVEL;
+            }
+            value = SQUARE_LEVEL ? 8000 : -8000;
+        }
+    }
+    if (next != AUDIO_R) {      /* drop rather than overwrite if the host stopped draining */
+        AUDIO[AUDIO_W] = value;
+        AUDIO_W = next;
+    }
+}
+
 static void step(void)
 {
     int seg_override = -1, rep = 0;
@@ -857,6 +935,11 @@ static void step(void)
     }
     ICOUNT++;
     execute(op, seg_override, rep);
+    AUDIO_ACC += AUDIO_RATE;
+    while (AUDIO_ACC >= INSTR_PER_SEC) {
+        AUDIO_ACC -= INSTR_PER_SEC;
+        audio_sample();
+    }
 }
 
 /* ---- public API --------------------------------------------------------------------------------------------- */
@@ -876,6 +959,8 @@ int alleycat_init(const void *exe_bytes, int exe_size)
     memset(S, 0, sizeof S);
     FLAGS = 0x0002; IP = 0; ICOUNT = 0; VIDEO_MODE = -1; STOPPED = 0;
     SCANCODE = 0; PORT61 = 0; RETRACE = 0; KEYQ_HEAD = KEYQ_TAIL = 0;
+    PIT2_DIVISOR = 0; PIT2_HIGH_BYTE_NEXT = 0;
+    AUDIO_W = AUDIO_R = 0; AUDIO_ACC = 0; SQUARE_PHASE = 0; SQUARE_LEVEL = 0;
     STATUS = "running";
     text_clear();
 
@@ -979,6 +1064,32 @@ int alleycat_screen_painted(void)
     uint32_t base = (uint32_t)VIDEO_SEG << 4;
     for (i = 0; i < 16384; i++) {
         if (MEM[base + i]) n++;
+    }
+    return n;
+}
+
+/* Both low bits of port 0x61: bit 0 gates the timer, bit 1 connects it to the cone. */
+int alleycat_speaker_on(void) { return (PORT61 & 0x03) == 0x03 && PIT2_DIVISOR > 0; }
+
+int alleycat_speaker_hz(void)
+{
+    if (PIT2_DIVISOR == 0) return 0;
+    return (int)(PIT_HZ / PIT2_DIVISOR);
+}
+
+int alleycat_audio_rate(void) { return AUDIO_RATE; }
+
+int alleycat_audio_available(void)
+{
+    return (AUDIO_W - AUDIO_R + AUDIO_RING) % AUDIO_RING;
+}
+
+int alleycat_audio_read(int16_t *out, int max_samples)
+{
+    int n = 0;
+    while (n < max_samples && AUDIO_R != AUDIO_W) {
+        out[n++] = AUDIO[AUDIO_R];
+        AUDIO_R = (AUDIO_R + 1) % AUDIO_RING;
     }
     return n;
 }
