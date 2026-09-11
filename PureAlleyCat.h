@@ -72,6 +72,16 @@ void alleycat_key(int scancode, int down);
 /* Non-zero once the program has set a graphics mode, i.e. it is past its startup checks. */
 int alleycat_ready(void);
 
+/* The BIOS text screen. The game prints its setup questions through teletype rather than drawing
+   them, so a host must show these rows or the player sees nothing and assumes it has hung. */
+const char *alleycat_text_row(int row);
+int alleycat_text_rows(void);
+
+/* How many of the 16384 framebuffer bytes are non-zero. The game blanks the graphics screen while
+   it asks a setup question and paints it while playing, so this is how a host decides whether to
+   show the text rows over the top or get out of the way. */
+int alleycat_screen_painted(void);
+
 /* Total instructions retired, and the last stop reason, for diagnostics. */
 uint64_t alleycat_instructions(void);
 const char *alleycat_status(void);
@@ -125,6 +135,12 @@ static uint64_t ICOUNT;
 static int      VIDEO_MODE = -1;
 static const char *STATUS = "not started";
 static uint8_t  FRAME[ALLEYCAT_WIDTH * ALLEYCAT_HEIGHT];
+/* The game prints its setup prompts through BIOS teletype rather than drawing them, so INT 10h
+   has to keep a text screen or every question is invisible and it reads as a hang. */
+#define TEXT_COLS 40
+#define TEXT_ROWS 25
+static char     TEXT[TEXT_ROWS][TEXT_COLS + 1];
+static int      CUR_ROW, CUR_COL;
 static uint8_t  SCANCODE;
 static uint8_t  PORT61;
 static uint32_t RETRACE;
@@ -360,6 +376,16 @@ static void port_out(uint16_t port, uint8_t value)
     if (port == 0x61) PORT61 = value;
 }
 
+static void text_clear(void)
+{
+    int r, c;
+    for (r = 0; r < TEXT_ROWS; r++) {
+        for (c = 0; c < TEXT_COLS; c++) TEXT[r][c] = ' ';
+        TEXT[r][TEXT_COLS] = 0;
+    }
+    CUR_ROW = CUR_COL = 0;
+}
+
 static void interrupt(int n);
 
 /* Returns 1 if the host answered, 0 to fall through to the interrupt vector table. */
@@ -374,8 +400,41 @@ static int bios(int n)
         return 1;
     }
     if (n == 0x10) {
-        if (ah == 0x00) VIDEO_MODE = get8(rAX);
-        return 1;
+        switch (ah) {
+        case 0x00:                      /* set mode */
+            VIDEO_MODE = get8(rAX);
+            text_clear();
+            return 1;
+        case 0x02:                      /* set cursor: DH row, DL column */
+            CUR_ROW = get8(6);
+            CUR_COL = get8(2);
+            return 1;
+        case 0x0E: {                    /* teletype: AL is the character */
+            uint8_t ch = get8(rAX);
+            if (ch == 13) {
+                CUR_COL = 0;
+            } else if (ch == 10) {
+                CUR_ROW++;
+            } else if (ch == 8) {
+                if (CUR_COL > 0) CUR_COL--;
+            } else {
+                if (CUR_ROW < TEXT_ROWS && CUR_COL < TEXT_COLS)
+                    TEXT[CUR_ROW][CUR_COL] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                CUR_COL++;
+            }
+            if (CUR_COL >= TEXT_COLS) { CUR_COL = 0; CUR_ROW++; }
+            if (CUR_ROW >= TEXT_ROWS) {
+                int r, c;
+                for (r = 0; r < TEXT_ROWS - 1; r++)
+                    for (c = 0; c < TEXT_COLS; c++) TEXT[r][c] = TEXT[r + 1][c];
+                for (c = 0; c < TEXT_COLS; c++) TEXT[TEXT_ROWS - 1][c] = ' ';
+                CUR_ROW = TEXT_ROWS - 1;
+            }
+            return 1;
+        }
+        default:                        /* palette, cursor shape and the rest: accepted, ignored */
+            return 1;
+        }
     }
     if (n == 0x11) { R[rAX] = 0x0021; return 1; }
     if (n == 0x12) { R[rAX] = 640;    return 1; }
@@ -818,6 +877,7 @@ int alleycat_init(const void *exe_bytes, int exe_size)
     FLAGS = 0x0002; IP = 0; ICOUNT = 0; VIDEO_MODE = -1; STOPPED = 0;
     SCANCODE = 0; PORT61 = 0; RETRACE = 0; KEYQ_HEAD = KEYQ_TAIL = 0;
     STATUS = "running";
+    text_clear();
 
 #define U16(o) ((uint16_t)(exe[(o)] | (exe[(o) + 1] << 8)))
     bytes_last  = U16(2);
@@ -900,6 +960,27 @@ void alleycat_palette(uint32_t out[4])
     /* CGA palette 1, high intensity: black, light cyan, light magenta, white. Which palette the
      * hardware shows is set through port 0x3D9, which this game leaves at the default. */
     out[0] = 0x000000; out[1] = 0x55FFFF; out[2] = 0xFF55FF; out[3] = 0xFFFFFF;
+}
+
+/* One row of the BIOS text screen, 0 to 24, NUL terminated. The setup prompts arrive here and
+   nowhere else, so a host that does not show this leaves the player looking at a blank screen. */
+const char *alleycat_text_row(int row)
+{
+    if (row < 0 || row >= TEXT_ROWS) return "";
+    TEXT[row][TEXT_COLS] = 0;
+    return TEXT[row];
+}
+
+int alleycat_text_rows(void) { return TEXT_ROWS; }
+
+int alleycat_screen_painted(void)
+{
+    int i, n = 0;
+    uint32_t base = (uint32_t)VIDEO_SEG << 4;
+    for (i = 0; i < 16384; i++) {
+        if (MEM[base + i]) n++;
+    }
+    return n;
 }
 
 int alleycat_ready(void) { return VIDEO_MODE >= 0; }

@@ -52,6 +52,9 @@ class CPU:
         self.call_log: list[tuple[int, int]] = []
         self.trace_calls = 0
         self.unhandled: dict[int, int] = {}
+        self.text = [[' '] * 40 for _ in range(25)]
+        self.cursor = [0, 0]
+        self.palette_call = None
 
     # ---- memory -------------------------------------------------------------------------
     def phys(self, seg: int, off: int) -> int:
@@ -668,8 +671,40 @@ class CPU:
             self.set8(AX, 0)
             return True
         if n == 0x10:
+            # The game writes its setup prompts through BIOS teletype, so these have to do
+            # something or the questions are invisible and it looks like a hang.
             if ah == 0x00:
                 self.video_mode = self.get8(AX)
+                self.text = [[' '] * 40 for _ in range(25)]
+                self.cursor = [0, 0]
+                return True
+            if ah == 0x02:                      # set cursor: DH row, DL column
+                self.cursor = [self.get8(6), self.get8(2)]
+                return True
+            if ah == 0x0B:                      # set palette / border
+                self.palette_call = (self.get8(7), self.get8(3))
+                return True
+            if ah == 0x0E:                      # teletype: AL is the character
+                ch = self.get8(AX)
+                row, col = self.cursor
+                if ch == 13:
+                    col = 0
+                elif ch == 10:
+                    row += 1
+                elif ch == 8:
+                    col = max(0, col - 1)
+                else:
+                    if row < 25 and col < 40:
+                        self.text[row][col] = chr(ch) if 32 <= ch < 127 else '?'
+                    col += 1
+                if col >= 40:
+                    col = 0
+                    row += 1
+                if row >= 25:                   # scroll
+                    self.text.pop(0)
+                    self.text.append([' '] * 40)
+                    row = 24
+                self.cursor = [row, col]
                 return True
             return True
         if n == 0x11:
