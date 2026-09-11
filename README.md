@@ -6,23 +6,33 @@ original data. Here the data file is the game's own `CAT.EXE`, which holds the c
 of its artwork, so nothing copyrighted ships here.
 
 ```c
-#include "purealleycat.h"
+#define ALLEYCAT_IMPLEMENTATION   /* in exactly one translation unit */
+#include "PureAlleyCat.h"
 
-purecat_init(exe_bytes, exe_size);
+alleycat_init(exe_bytes, exe_size);
 while (running) {
-    purecat_key(PURECAT_KEY_LEFT, held);
-    purecat_update();                       /* one 18.2 Hz tick */
-    draw(purecat_framebuffer());            /* 320x200, one byte per pixel, values 0-3 */
+    alleycat_key(ALLEYCAT_KEY_LEFT, held);
+    alleycat_update();                       /* one 18.2 Hz tick */
+    draw(alleycat_framebuffer());            /* 320x200, one byte per pixel, values 0-3 */
 }
 ```
 
-Two files. No allocation, no file I/O, no dependency beyond `<stdint.h>` and `<string.h>`. One
-megabyte of emulated memory lives in BSS, so it is a large static object rather than a heap user.
+**One header, nothing else.** `PureAlleyCat.h` is the whole library, stb-style: define
+`ALLEYCAT_IMPLEMENTATION` in exactly one translation unit and that unit gets the interpreter,
+exactly as PureDOOM's `DOOM_IMPLEMENTATION` works. Every other unit includes it for the
+declarations alone.
+
+No allocation, no file I/O, no dependency beyond `<stdint.h>` and `<string.h>`. One megabyte of
+emulated memory lives in BSS, so it is a large static object rather than a heap user.
 
 ```bash
-zig cc purealleycat.c demo.c -o purealleycat_demo -O2 -std=c99
-./purealleycat_demo /path/to/CAT.EXE 2000000 screen.ppm
+zig cc demo.c -o alleycat_demo -O2 -std=c99
+./alleycat_demo /path/to/CAT.EXE 2000000 screen.ppm
 ```
+
+Vendoring it into a host works the same way PureDOOM does in `godot-doom-gdextension`: drop the
+header into `thirdparty/`, and add a one-line unit that defines `ALLEYCAT_IMPLEMENTATION` and
+includes it.
 
 Builds clean at `-O2 -std=c99` with no warnings.
 
@@ -61,7 +71,7 @@ A Python interpreter (`tools/emu8086.py`) was written first and validated by run
 library is a port of that, and the two are compared pixel-by-pixel at two million instructions:
 
 ```
-C purealleycat vs Python reference: 0 differing pixels of 64000
+PureAlleyCat vs Python reference: 0 differing pixels of 64000
 IDENTICAL
 ```
 
@@ -87,35 +97,32 @@ Sprites are drawn by a routine that takes its geometry in `CX`: `CL` is the widt
 stored anywhere; the blitter derives a mask at draw time from the pixel values, with colour index
 0 acting as the key.
 
-`purecat_framebuffer()` hands back the decoded 320x200 bytes and `purecat_palette()` the four
+`alleycat_framebuffer()` hands back the decoded 320x200 bytes and `alleycat_palette()` the four
 colours, so a host never needs to know any of that.
 
 ## API
 
 | Function | |
 | --- | --- |
-| `purecat_init(exe, size)` | load `CAT.EXE` and reset; 0 on success |
-| `purecat_update()` | run one tick |
-| `purecat_run(n)` | run exactly n instructions |
-| `purecat_framebuffer()` | 320x200 bytes, each 0-3 |
-| `purecat_palette(out[4])` | the four colours as `0xRRGGBB` |
-| `purecat_key(scancode, down)` | queue a key |
-| `purecat_ready()` | non-zero once a graphics mode is set |
-| `purecat_instructions()`, `purecat_status()` | diagnostics |
-| `purecat_fault_opcode()`, `purecat_fault_address()` | what stopped a run, if anything |
+| `alleycat_init(exe, size)` | load `CAT.EXE` and reset; 0 on success |
+| `alleycat_update()` | run one tick |
+| `alleycat_run(n)` | run exactly n instructions |
+| `alleycat_framebuffer()` | 320x200 bytes, each 0-3 |
+| `alleycat_palette(out[4])` | the four colours as `0xRRGGBB` |
+| `alleycat_key(scancode, down)` | queue a key |
+| `alleycat_ready()` | non-zero once a graphics mode is set |
+| `alleycat_instructions()`, `alleycat_status()` | diagnostics |
+| `alleycat_fault_opcode()`, `alleycat_fault_address()` | what stopped a run, if anything |
 
 Keys go through the game's own INT 9 handler, because it installs one and reads port 0x60 directly
-rather than calling INT 16h. `purecat_key` queues a set-1 make or break code and raises interrupt
+rather than calling INT 16h. `alleycat_key` queues a set-1 make or break code and raises interrupt
 9 once interrupts are enabled, which is what the hardware did.
-
-The functions keep the short `purecat_` prefix while the files are named for the repository, the
-same way PureDOOM's are `doom_`.
 
 ## Known gaps
 
 - **Sound is silent.** Writes to the speaker gate and the PIT are accepted and discarded. The data
   to drive a square wave is all there; nothing consumes it yet.
-- **The joystick always reads centred with buttons up.** `purecat_key` covers the keyboard only.
+- **The joystick always reads centred with buttons up.** `alleycat_key` covers the keyboard only.
 - **The palette is fixed** to CGA palette 1, high intensity. A program can change it through port
   `0x3d9`; this one does not appear to, but the write would not be honoured if it did.
 

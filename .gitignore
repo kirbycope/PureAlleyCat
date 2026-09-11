@@ -9,8 +9,8 @@
 *.ppm
 # Screenshots are of the game, so they are its artwork, not ours. Keep them out.
 *.png
-purealleycat_demo
-purealleycat_demo.exe
+alleycat_demo
+alleycat_demo.exe
 call_trace.txt
 
 __pycache__/

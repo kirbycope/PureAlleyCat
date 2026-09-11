@@ -1,11 +1,13 @@
 /* Headless demo for purecat: load CAT.EXE, run a while, write the screen out as a PPM.
  *
- *     purecat_demo <CAT.EXE> [instructions] [out.ppm]
+ *     alleycat_demo <CAT.EXE> [instructions] [out.ppm]
  *
  * The point of it is verification. Running the same instruction count as tools/emu8086.py must
  * give a pixel-identical screen; if it does, this C port and the Python reference agree.
  */
-#include "purealleycat.h"
+/* The single header carries the whole library; one unit defines this. */
+#define ALLEYCAT_IMPLEMENTATION
+#include "PureAlleyCat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,34 +24,34 @@ int main(int argc, char **argv)
     int size = (int)fread(exe, 1, sizeof exe, file);
     fclose(file);
 
-    if (purecat_init(exe, size) != 0) {
+    if (alleycat_init(exe, size) != 0) {
         fprintf(stderr, "%s: not an MZ executable\n", path);
         return 1;
     }
     printf("loaded %d bytes\n", size);
 
-    purecat_run((int)steps);
+    alleycat_run((int)steps);
 
-    printf("instructions: %llu\n", (unsigned long long)purecat_instructions());
-    printf("status: %s\n", purecat_status());
-    if (purecat_fault_opcode() >= 0)
-        printf("fault: opcode %02X at %04X:%04X\n", purecat_fault_opcode(),
-               purecat_fault_address() >> 16, purecat_fault_address() & 0xFFFF);
-    printf("video mode set: %s\n", purecat_ready() ? "yes" : "no");
+    printf("instructions: %llu\n", (unsigned long long)alleycat_instructions());
+    printf("status: %s\n", alleycat_status());
+    if (alleycat_fault_opcode() >= 0)
+        printf("fault: opcode %02X at %04X:%04X\n", alleycat_fault_opcode(),
+               alleycat_fault_address() >> 16, alleycat_fault_address() & 0xFFFF);
+    printf("video mode set: %s\n", alleycat_ready() ? "yes" : "no");
 
-    const unsigned char *frame = purecat_framebuffer();
+    const unsigned char *frame = alleycat_framebuffer();
     unsigned int palette[4];
-    purecat_palette(palette);
+    alleycat_palette(palette);
 
     int painted = 0;
-    for (int i = 0; i < PURECAT_WIDTH * PURECAT_HEIGHT; i++)
+    for (int i = 0; i < ALLEYCAT_WIDTH * ALLEYCAT_HEIGHT; i++)
         if (frame[i]) painted++;
-    printf("non-background pixels: %d of %d\n", painted, PURECAT_WIDTH * PURECAT_HEIGHT);
+    printf("non-background pixels: %d of %d\n", painted, ALLEYCAT_WIDTH * ALLEYCAT_HEIGHT);
 
     FILE *ppm = fopen(out, "wb");
     if (!ppm) { perror(out); return 1; }
-    fprintf(ppm, "P6\n%d %d\n255\n", PURECAT_WIDTH, PURECAT_HEIGHT);
-    for (int i = 0; i < PURECAT_WIDTH * PURECAT_HEIGHT; i++) {
+    fprintf(ppm, "P6\n%d %d\n255\n", ALLEYCAT_WIDTH, ALLEYCAT_HEIGHT);
+    for (int i = 0; i < ALLEYCAT_WIDTH * ALLEYCAT_HEIGHT; i++) {
         unsigned int rgb = palette[frame[i]];
         fputc((int)((rgb >> 16) & 0xFF), ppm);
         fputc((int)((rgb >> 8) & 0xFF), ppm);
